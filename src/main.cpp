@@ -1,9 +1,15 @@
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "readability-static-accessed-through-instance"
+#pragma ide diagnostic ignored "cppcoreguidelines-narrowing-conversions"
+#pragma ide diagnostic ignored "cert-err58-cpp"
+
 #include <Arduino.h>
 #include <Wire.h>
 #include "WiFi.h"
-#include "VL53L0X.h"
+#include "HCSR04.h"
 #include "LiquidCrystal.h"
 #include "HTTPClient.h"
+#include "string.h"
 
 const char *ssid = "Wireless13 - 2.4GHz";
 const char *password = "Happy13family";
@@ -23,8 +29,17 @@ unsigned long lastTime = 0;
 #define BTN 15
 #define BL  2
 
+#define ECHO 16
+#define TRIGGER 17
+#define TEMP_AMB 24
+#define MAX_DIST 300
+
+#define FULL 24 // 24 cm == 1000 L
+#define EMPTY 85
+
 LiquidCrystal lcd(RS, EN, D4, D5, D6, D7);
-VL53L0X sensor;
+
+HCSR04 ultrasonicSensor(TRIGGER, ECHO, TEMP_AMB, MAX_DIST);
 
 /*
  *  Barras de progresso
@@ -35,16 +50,20 @@ byte bar3[8] = {0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C};
 byte bar4[8] = {0x1E, 0x1E, 0x1E, 0x1E, 0x1E, 0x1E, 0x1E, 0x1E};
 byte bar5[8] = {0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F};
 
+float current_distance = 0;
+double current_level = 0;
+
 void (*resetFunc)() = nullptr;
 
 void setup() {
-
-    pinMode(BL, OUTPUT);
-    pinMode(BTN, INPUT);
-    digitalWrite(BL, HIGH);
-
     Serial.begin(115200);
 
+    /*
+     *  LCD
+     */
+    pinMode(BL, OUTPUT);
+    pinMode(BTN, INPUT);
+    digitalWrite(BL, LOW);
     lcd.createChar(1, bar1);
     lcd.createChar(2, bar2);
     lcd.createChar(3, bar3);
@@ -52,85 +71,60 @@ void setup() {
     lcd.createChar(5, bar5);
     lcd.begin(20, 2);
     lcd.clear();
+    digitalWrite(BL, HIGH);
 
-    Wire.begin();
+    /*
+     *  Sensor
+     */
+    ultrasonicSensor.begin();
 
-    sensor.setTimeout(500);
-    if (!sensor.init()) {
-        lcd.print("Sem sensor.");
-        Serial.println("Sem sensor");
-        lcd.setCursor(0, 1);
-
-        delay(2000);
-        resetFunc();
-    }
-
-    sensor.startContinuous();
-
+    /*
+     *  Wifi
+     */
     WiFi.setSleep(false);
     WiFi.enableSTA(true);
     delay(1000);
 
     WiFi.begin(ssid, password);
 
-    while (WiFi.status() != 3) {
+    while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.println("Connecting to WiFi..");
-        Serial.println(WiFi.status());
+        if (WiFi.status() == WL_CONNECT_FAILED) {
+            resetFunc();
+        }
     }
 
-    Serial.println("Connected to the WiFi network");
+    Serial.println("Done");
 }
 
-void LCD_progress_bar(int row, int var, int minVal, int maxVal) {
-    int block = map(var, minVal, maxVal, 0,
-                    18);   // Block represent the current LCD space (modify the map setting to fit your LCD)
-    int line = map(var, minVal, maxVal, 0, 100);     // Line represent the theoretical lines that should be printed
+void draw_bar() {
+    int block = map(current_level, 0, 100, 0,
+                    20);   // Block represent the current LCD space (modify the map setting to fit your LCD)
+    int line = map(current_level, 0, 100, 0, 100);     // Line represent the theoretical lines that should be printed
     int bar = (line - (block * 5));                             // Bar represent the actual lines that will be printed
 
-    lcd.setCursor(0, row);
-    lcd.write("E");
-    for (int x = 1; x < block + 1; x++)                        // Print all the filled blocks
+    /* LCD Progress Bar Characters, create your custom bars */
+
+    for (int x = 0; x < block; x++)                        // Print all the filled blocks
     {
-        lcd.setCursor(x, row);
+        lcd.setCursor(x, 1);
         lcd.write(1023);
     }
 
     lcd.setCursor(block,
-                  row);                            // Set the cursor at the current block and print the numbers of line needed
+                  1);                            // Set the cursor at the current block and print the numbers of line needed
     if (bar != 0) lcd.write(bar);
     if (block == 0 && line == 0) lcd.write(1022);   // Unless there is nothing to print, in this case show blank
 
-    for (int x = 20; x > block; x--)                       // Print all the blank blocks
+    for (int x = 16; x > block; x--)                       // Print all the blank blocks
     {
-        lcd.setCursor(x, row);
+        lcd.setCursor(x, 1);
         lcd.write(1022);
     }
-
-    lcd.setCursor(19, row);
-    lcd.write("F");
 }
 
-void loop() {
-
-    int nivel = sensor.readRangeContinuousMillimeters();
-    lcd.clear();
-
-    if (sensor.timeoutOccurred()) {
-        Serial.print("TIMEOUT COM O SENSOR");
-    } else {
-        lcd.setCursor(0, 0);
-        lcd.print("QUANTIDADE:");
-        lcd.print(nivel);
-
-        if (nivel > 3000) {
-            lcd.setCursor(0, 1);
-            lcd.print("Fora do nivel. > 3000");
-        } else {
-            LCD_progress_bar(1, 400 - nivel, 0, 400);
-        }
-    }
-
+void transmit() {
     if ((millis() - lastTime) > timerDelay) {
         if (WiFi.status() == WL_CONNECTED) {
             HTTPClient http;
@@ -138,9 +132,11 @@ void loop() {
             http.begin(serverName);
 
             http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-            String httpRequestData = "nivel=" + String(nivel);
-            http.POST(httpRequestData);
+            String httpRequestData = "nivel=" + String(current_level);
+            int respCode = http.POST(httpRequestData);
 
+            Serial.print("Transmitindo. Resp: ");
+            Serial.println(respCode);
             http.end();
         } else {
             resetFunc();
@@ -148,6 +144,37 @@ void loop() {
 
         lastTime = millis();
     }
+}
+
+void loop() {
+
+    current_distance = ultrasonicSensor.getMedianFilterDistance(); //pass 3 measurements through median filter, better result on moving obstacles
+
+    if (current_distance != HCSR04_OUT_OF_RANGE) {
+        Serial.print(current_distance, 1);
+        Serial.println(F(" cm"));
+
+        current_level = 100.0 - ((100.0 / (EMPTY - FULL)) * (current_distance - FULL));
+        if (current_level < 0) current_level = 0;
+        if (current_level > 100) current_level = 100;
+
+        Serial.print(current_level);
+        Serial.println(F(" %"));
+
+        lcd.setCursor(0, 0);
+        lcd.print("Nivel:");
+
+        lcd.setCursor(13, 0);
+        lcd.print(current_level, 2);
+        lcd.print("%");
+
+
+        transmit();
+        draw_bar();
+    }
 
     delay(1000);
+
 }
+
+#pragma clang diagnostic pop
